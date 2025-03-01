@@ -1,0 +1,42 @@
+name: 🔄 同步 Fork 仓库 (Sync Fork Repository)
+
+on:
+  schedule:
+    # 每周日 UTC 0 点运行一次 (Runs every Sunday at UTC 0)
+    - cron: '0 0 * * 0'
+  workflow_dispatch:  # 允许手动触发工作流 (Allows manual workflow triggers)
+
+jobs:
+  sync:
+    name: 🔄 同步上游变更 (Sync with Upstream)
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 📥 检出代码 (Checkout code)
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  # 获取完整的历史记录 (Fetch the entire history)
+      
+      - name: ⚙️ 配置 Git (Configure Git)
+        run: |
+          git config --global user.name 'GitHub Actions'
+          git config --global user.email 'actions@github.com'
+      
+      - name: 🔗 添加上游仓库 (Add upstream repository)
+        run: |
+          git remote add upstream https://github.com/abi/screenshot-to-code.git
+      
+      - name: 📡 获取上游更新 (Fetch upstream changes)
+        run: |
+          git fetch upstream
+      
+      - name: 🔀 同步主分支 (Sync main branch)
+        run: |
+          # 检出主分支（main 或 master）(Checkout main branch (main or master))
+          git checkout main || git checkout master
+          # 合并上游变更 (Merge upstream changes)
+          git merge upstream/main || git merge upstream/master
+      
+      - name: 📤 推送更新 (Push updates)
+        run: |
+          git push
