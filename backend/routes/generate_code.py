@@ -17,7 +17,13 @@ from config import (
     SHOULD_MOCK_AI_RESPONSE,
 )
 from custom_types import InputMode
-from llm import Completion, Llm
+from llm import (
+    Completion,
+    Llm,
+    OPENAI_MODELS,
+    ANTHROPIC_MODELS,
+    GEMINI_MODELS,
+)
 from models import (
     stream_claude_response,
     stream_claude_response_native,
@@ -38,6 +44,8 @@ from typing import (
 )
 from openai.types.chat import ChatCompletionMessageParam
 
+from utils import print_prompt_summary
+
 # WebSocket message types
 MessageType = Literal[
     "chunk",
@@ -51,7 +59,7 @@ MessageType = Literal[
 from image_generation.core import generate_images
 from prompts import create_prompt
 from prompts.claude_prompts import VIDEO_PROMPT
-from prompts.types import Stack
+from prompts.types import Stack, PromptContent
 
 # from utils import pprint_prompt
 from ws.constants import APP_ERROR_WEB_SOCKET_CODE  # type: ignore
@@ -164,13 +172,13 @@ class WebSocketCommunicator:
         """Send a message to the client with debug logging"""
         # Print for debugging on the backend
         if type == "error":
-            print(f"Error (variant {variantIndex}): {value}")
+            print(f"Error (variant {variantIndex + 1}): {value}")
         elif type == "status":
-            print(f"Status (variant {variantIndex}): {value}")
+            print(f"Status (variant {variantIndex + 1}): {value}")
         elif type == "variantComplete":
-            print(f"Variant {variantIndex} complete")
+            print(f"Variant {variantIndex + 1} complete")
         elif type == "variantError":
-            print(f"Variant {variantIndex} error: {value}")
+            print(f"Variant {variantIndex + 1} error: {value}")
 
         await self.websocket.send_json(
             {"type": type, "value": value, "variantIndex": variantIndex}
@@ -206,6 +214,9 @@ class ExtractedParams:
     anthropic_api_key: str | None
     openai_base_url: str | None
     generation_type: Literal["create", "update"]
+    prompt: PromptContent
+    history: List[Dict[str, Any]]
+    is_imported_from_code: bool
 
 
 class ParameterExtractionStage:
@@ -261,6 +272,15 @@ class ParameterExtractionStage:
             raise ValueError(f"Invalid generation type: {generation_type}")
         generation_type = cast(Literal["create", "update"], generation_type)
 
+        # Extract prompt content
+        prompt = params.get("prompt", {"text": "", "images": []})
+
+        # Extract history (default to empty list)
+        history = params.get("history", [])
+
+        # Extract imported code flag
+        is_imported_from_code = params.get("isImportedFromCode", False)
+
         return ExtractedParams(
             stack=validated_stack,
             input_mode=validated_input_mode,
@@ -269,6 +289,9 @@ class ParameterExtractionStage:
             anthropic_api_key=anthropic_api_key,
             openai_base_url=openai_base_url,
             generation_type=generation_type,
+            prompt=prompt,
+            history=history,
+            is_imported_from_code=is_imported_from_code,
         )
 
     def _get_from_settings_dialog_or_env(
@@ -315,7 +338,7 @@ class ModelSelectionStage:
             # Print the variant models (one per line)
             print("Variant models:")
             for index, model in enumerate(variant_models):
-                print(f"Variant {index}: {model.value}")
+                print(f"Variant {index + 1}: {model.value}")
 
             return variant_models
         except Exception:
@@ -337,11 +360,7 @@ class ModelSelectionStage:
     ) -> List[Llm]:
         """Simple model cycling that scales with num_variants"""
 
-        # Determine primary Claude model based on generation type
-        if generation_type == "create":
-            claude_model = Llm.CLAUDE_3_7_SONNET_2025_02_19
-        else:
-            claude_model = Llm.CLAUDE_3_5_SONNET_2024_06_20
+        claude_model = Llm.CLAUDE_3_7_SONNET_2025_02_19
 
         # For text input mode, use Claude 4 Sonnet as third option
         # For other input modes (image/video), use Gemini as third option
@@ -352,10 +371,14 @@ class ModelSelectionStage:
             if generation_type == "create":
                 third_model = Llm.GEMINI_2_0_FLASH
             else:
-                third_model = Llm.CLAUDE_3_7_SONNET_2025_02_19
+                third_model = claude_model
 
         # Define models based on available API keys
-        if openai_api_key and anthropic_api_key and (gemini_api_key or input_mode == "text"):
+        if (
+            openai_api_key
+            and anthropic_api_key
+            and (gemini_api_key or input_mode == "text")
+        ):
             models = [
                 Llm.GPT_4_1_2025_04_14,
                 claude_model,
@@ -386,15 +409,21 @@ class PromptCreationStage:
 
     async def create_prompt(
         self,
-        params: Dict[str, str],
-        stack: Stack,
-        input_mode: InputMode,
+        extracted_params: ExtractedParams,
     ) -> tuple[List[ChatCompletionMessageParam], Dict[str, str]]:
         """Create prompt messages and return image cache"""
         try:
             prompt_messages, image_cache = await create_prompt(
-                params, stack, input_mode
+                stack=extracted_params.stack,
+                input_mode=extracted_params.input_mode,
+                generation_type=extracted_params.generation_type,
+                prompt=extracted_params.prompt,
+                history=extracted_params.history,
+                is_imported_from_code=extracted_params.is_imported_from_code,
             )
+
+            print_prompt_summary(prompt_messages, truncate=False)
+
             return prompt_messages, image_cache
         except Exception:
             await self.throw_error(
@@ -564,15 +593,7 @@ class ParallelGenerationStage:
         tasks: List[Coroutine[Any, Any, Completion]] = []
 
         for index, model in enumerate(variant_models):
-            if (
-                model == Llm.GPT_4O_2024_11_20
-                or model == Llm.O1_2024_12_17
-                or model == Llm.O4_MINI_2025_04_16
-                or model == Llm.O3_2025_04_16
-                or model == Llm.GPT_4_1_2025_04_14
-                or model == Llm.GPT_4_1_MINI_2025_04_14
-                or model == Llm.GPT_4_1_NANO_2025_04_14
-            ):
+            if model in OPENAI_MODELS:
                 if self.openai_api_key is None:
                     raise Exception("OpenAI API key is missing.")
 
@@ -583,13 +604,7 @@ class ParallelGenerationStage:
                         index=index,
                     )
                 )
-            elif GEMINI_API_KEY and (
-                model == Llm.GEMINI_2_0_PRO_EXP
-                or model == Llm.GEMINI_2_0_FLASH_EXP
-                or model == Llm.GEMINI_2_0_FLASH
-                or model == Llm.GEMINI_2_5_FLASH_PREVIEW_05_20
-                or model == Llm.GEMINI_2_5_PRO_PREVIEW_05_06
-            ):
+            elif GEMINI_API_KEY and model in GEMINI_MODELS:
                 tasks.append(
                     stream_gemini_response(
                         prompt_messages,
@@ -598,13 +613,7 @@ class ParallelGenerationStage:
                         model_name=model.value,
                     )
                 )
-            elif (
-                model == Llm.CLAUDE_3_5_SONNET_2024_06_20
-                or model == Llm.CLAUDE_3_5_SONNET_2024_10_22
-                or model == Llm.CLAUDE_3_7_SONNET_2025_02_19
-                or model == Llm.CLAUDE_4_SONNET_2025_05_14
-                or model == Llm.CLAUDE_4_OPUS_2025_05_14
-            ):
+            elif model in ANTHROPIC_MODELS:
                 if self.anthropic_api_key is None:
                     raise Exception("Anthropic API key is missing.")
 
@@ -647,7 +656,7 @@ class ParallelGenerationStage:
                 model_name=model_name,
             )
         except openai.AuthenticationError as e:
-            print(f"[VARIANT {index}] OpenAI Authentication failed", e)
+            print(f"[VARIANT {index + 1}] OpenAI Authentication failed", e)
             error_message = (
                 "Incorrect OpenAI key. Please make sure your OpenAI API key is correct, "
                 "or create a new OpenAI API key on your OpenAI dashboard."
@@ -660,7 +669,7 @@ class ParallelGenerationStage:
             await self.send_message("variantError", error_message, index)
             raise VariantErrorAlreadySent(e)
         except openai.NotFoundError as e:
-            print(f"[VARIANT {index}] OpenAI Model not found", e)
+            print(f"[VARIANT {index + 1}] OpenAI Model not found", e)
             error_message = (
                 e.message
                 + ". Please make sure you have followed the instructions correctly to obtain "
@@ -675,7 +684,7 @@ class ParallelGenerationStage:
             await self.send_message("variantError", error_message, index)
             raise VariantErrorAlreadySent(e)
         except openai.RateLimitError as e:
-            print(f"[VARIANT {index}] OpenAI Rate limit exceeded", e)
+            print(f"[VARIANT {index + 1}] OpenAI Rate limit exceeded", e)
             error_message = (
                 "OpenAI error - 'You exceeded your current quota, please check your plan and billing details.'"
                 + (
@@ -753,12 +762,12 @@ class ParallelGenerationStage:
                 )
             except Exception as inner_e:
                 # If websocket is closed or other error during post-processing
-                print(f"Post-processing error for variant {index}: {inner_e}")
+                print(f"Post-processing error for variant {index + 1}: {inner_e}")
                 # We still keep the completion in variant_completions
 
         except Exception as e:
             # Handle any errors that occurred during generation
-            print(f"Error in variant {index}: {e}")
+            print(f"Error in variant {index + 1}: {e}")
             traceback.print_exception(type(e), e, e.__traceback__)
 
             # Only send error message if it hasn't been sent already
@@ -835,9 +844,7 @@ class PromptCreationMiddleware(Middleware):
         assert context.extracted_params is not None
         context.prompt_messages, context.image_cache = (
             await prompt_creator.create_prompt(
-                context.params,
-                context.extracted_params.stack,
-                context.extracted_params.input_mode,
+                context.extracted_params,
             )
         )
 
